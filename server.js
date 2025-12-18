@@ -3,7 +3,7 @@ const cors = require('cors');
 const { InfluxDB } = require('@influxdata/influxdb-client');
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
@@ -17,17 +17,26 @@ const bucket = 'biogas_data';
 const influxDB = new InfluxDB({ url, token });
 const queryApi = influxDB.getQueryApi(org);
 
+// Store the last received data and timestamp
+let lastData = null;
+let lastDataTime = null;
+
 // Home Route
 app.get('/', (req, res) => {
   res.json({
     message: '🔥 Biogas Monitoring API is running!',
-    status: 'online'
+    status: 'online',
+    lastDataReceived: lastDataTime ? lastDataTime.toISOString() : 'Never'
   });
 });
 
 // Health Check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'healthy', database: 'InfluxDB Cloud' });
+  res.json({ 
+    status: 'healthy', 
+    database: 'InfluxDB Cloud',
+    lastDataTime: lastDataTime ? lastDataTime.toISOString() : null
+  });
 });
 
 // Get Latest Sensor Data
@@ -35,38 +44,66 @@ app.get('/api/sensors/latest', async (req, res) => {
   try {
     const query = `
       from(bucket: "${bucket}")
-        |> range(start: -5m)
+        |> range(start: -1h)
         |> filter(fn: (r) => r._measurement == "biogas_sensor")
         |> last()
     `;
 
     const results = {};
+    let dataTimestamp = null;
     
     await new Promise((resolve, reject) => {
       queryApi.queryRows(query, {
         next(row, tableMeta) {
           const data = tableMeta.toObject(row);
           results[data._field] = data._value;
-          results.timestamp = data._time;
+          // Get the actual timestamp from InfluxDB
+          if (data._time) {
+            dataTimestamp = data._time;
+          }
         },
         error: reject,
         complete: resolve
       });
     });
 
-    res.json({
-      success: true,
-      data: {
+    // Check if we got new data
+    const hasData = Object.keys(results).length > 0;
+    
+    if (hasData) {
+      // Update last known data
+      lastData = {
         temperature: results.temperature || 0,
         pressure: results.pressure || 0,
         ph_level: results.ph_level || 0,
         humidity: results.humidity || 0,
-        concentration: results.concentration || 0,
-        timestamp: results.timestamp
+        concentration: results.concentration || 0
+      };
+      lastDataTime = dataTimestamp ? new Date(dataTimestamp) : new Date();
+    }
+
+    // Calculate how old the data is
+    const now = new Date();
+    const dataAge = lastDataTime ? Math.floor((now - lastDataTime) / 1000) : null;
+    const isStale = dataAge !== null && dataAge > 15; // Data older than 15 seconds is stale
+
+    res.json({
+      success: hasData,
+      isStale: isStale,
+      dataAgeSeconds: dataAge,
+      dataTimestamp: lastDataTime ? lastDataTime.toISOString() : null,
+      serverTime: now.toISOString(),
+      data: lastData || {
+        temperature: 0,
+        pressure: 0,
+        ph_level: 0,
+        humidity: 0,
+        concentration: 0
       }
     });
 
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -96,13 +133,17 @@ app.get('/api/sensors/history', async (req, res) => {
       });
     });
 
-    const historyArray = Object.values(dataPoints).sort((a, b) => 
-      new Date(a.time) - new Date(b.time)
-    );
+    const historyArray = Object.values(dataPoints)
+      .filter(item => {
+        // Filter out entries with all zeros
+        return Object.values(item).some(val => typeof val === 'number' && val > 0);
+      })
+      .sort((a, b) => new Date(a.time) - new Date(b.time));
 
     res.json({ success: true, count: historyArray.length, data: historyArray });
 
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -153,6 +194,7 @@ app.get('/api/alerts', async (req, res) => {
     res.json({ success: true, alertCount: alerts.length, alerts });
 
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
